@@ -1,0 +1,125 @@
+# Punto de entrada de Streamlit
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from core.db import DartsDatabase
+from core.features import FeatureExtractor
+from core.ml_model import AdvancedDartsModel
+
+ROOT = Path(__file__).resolve().parent
+DB_PATH = ROOT / "data" / "darts_public.sqlite"
+
+
+@st.cache_resource
+def load_runtime():
+    db = DartsDatabase(db_path=str(DB_PATH))
+    conn = db.get_connection()
+    players = pd.read_sql_query(
+        "SELECT DISTINCT player FROM match_stats ORDER BY player",
+        conn,
+    )["player"].tolist()
+    conn.close()
+    return db, FeatureExtractor(db), AdvancedDartsModel(db), players
+
+
+def _pct(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
+
+def main() -> None:
+    st.set_page_config(page_title="GRAVEL", layout="centered")
+    st.title("GRAVEL")
+    st.caption("Probabilidades informativas de dardos. No es una herramienta de apuestas.")
+
+    db, fe, model, players = load_runtime()
+
+    if model.v8_model is None:
+        st.error(model.load_error or "No se pudo cargar models/darts_v8.pkl")
+        return
+
+    if len(players) < 2:
+        st.error("No hay suficientes jugadores en data/darts_public.sqlite")
+        return
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        player_a = st.selectbox("Jugador A", players, index=0)
+    with col_b:
+        default_b = 1 if players[0] == player_a else 0
+        player_b = st.selectbox("Jugador B", players, index=default_b)
+
+    first_throw_choice = st.radio(
+        "¿Quién saca primero?",
+        options=[True, False],
+        format_func=lambda a_throws: f"{player_a} (Jugador A)" if a_throws else f"{player_b} (Jugador B)",
+        horizontal=True,
+    )
+
+    if not st.button("Calcular probabilidad", type="primary"):
+        return
+
+    if player_a == player_b:
+        st.warning("Elige dos jugadores distintos.")
+        return
+
+    feat_a = fe.get_player_features(player_a)
+    feat_b = fe.get_player_features(player_b)
+
+    missing = []
+    if feat_a is None:
+        missing.append(player_a)
+    if feat_b is None:
+        missing.append(player_b)
+    if missing:
+        st.warning(
+            "No hay suficientes partidos históricos (mínimo 5) para: "
+            + ", ".join(missing)
+        )
+        return
+
+    feat_a = fe.get_player_features(player_a, opp_avg=feat_b.avg_score)
+    feat_b = fe.get_player_features(player_b, opp_avg=feat_a.avg_score)
+    h2h = fe.get_h2h_summary(player_a, player_b)
+    pred = model.predict_match(
+        feat_a,
+        feat_b,
+        h2h_a_winrate=h2h["win_rate_a"],
+        first_throw_a=bool(first_throw_choice),
+    )
+
+    res_a, res_b = st.columns(2)
+    for col, feat, prob in (
+        (res_a, feat_a, pred.prob_a),
+        (res_b, feat_b, pred.prob_b),
+    ):
+        with col:
+            st.subheader(feat.player_name)
+            st.metric("Probabilidad", _pct(prob))
+            st.write(f"ELO: {feat.elo_rating:.0f}")
+            st.write(f"Win rate: {_pct(feat.win_rate)}")
+            st.write(f"Average: {feat.avg_score:.2f}")
+            st.write(f"Checkout: {feat.avg_checkout:.1f}%")
+            st.write(f"180s: {feat.avg_180s:.2f}")
+
+    st.subheader("H2H")
+    n_h2h = int(h2h["n_matches"])
+    if n_h2h == 0:
+        st.write("Sin enfrentamientos directos registrados")
+    else:
+        df_h2h = db.get_h2h(player_a, player_b)
+        wins_a = int(df_h2h["result"].sum()) if not df_h2h.empty else 0
+        wins_b = n_h2h - wins_a
+        label = "partido" if n_h2h == 1 else "partidos"
+        st.write(
+            f"Enfrentamientos directos: {n_h2h} {label} — "
+            f"{player_a} {wins_a}, {player_b} {wins_b}"
+        )
+        st.write(
+            f"Average en sus enfrentamientos: {h2h['avg_a']:.2f} vs {h2h['avg_b']:.2f}"
+        )
+
+
+if __name__ == "__main__":
+    main()
