@@ -12,10 +12,13 @@ logger = logging.getLogger("gravel_db")
 
 def parse_fixture_dates(values) -> pd.Series:
     """Parsea fixture_date a UTC. NULL y valores ilegibles → NaT. No inventa fechas."""
-    s = pd.Series(values)
+    s = pd.Series([] if values is None else values, dtype="object")
     if s.empty:
-        return pd.to_datetime(s, utc=True)
-    return pd.to_datetime(s, utc=True, format="mixed", errors="coerce")
+        return pd.Series(pd.DatetimeIndex([], tz="UTC"))
+    parsed = pd.to_datetime(s, utc=True, format="mixed", errors="coerce")
+    if not isinstance(parsed, pd.Series):
+        parsed = pd.Series(parsed)
+    return parsed
 
 
 def clip_checkout_pct(df: pd.DataFrame) -> pd.DataFrame:
@@ -173,7 +176,9 @@ class DartsDatabase:
                 )
             ]
         parsed = parse_fixture_dates(raw_dates)
-        max_date = parsed.max() if not parsed.isna().all() else pd.NaT
+        if not isinstance(parsed, pd.Series):
+            parsed = pd.Series(parsed)
+        max_date = parsed.max() if len(parsed) > 0 and not parsed.isna().all() else pd.NaT
         return {
             "n_rows": int(n_rows),
             "n_matches": int(n_matches),

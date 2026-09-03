@@ -1,8 +1,12 @@
 # Punto de entrada de Streamlit
 from pathlib import Path
+import sys
 
 import pandas as pd
 import streamlit as st
+
+for _mod in [k for k in sys.modules if k == "core" or k.startswith("core.")]:
+    del sys.modules[_mod]
 
 from core.db import DartsDatabase
 from core.features import FeatureExtractor
@@ -13,8 +17,45 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "darts_public.sqlite"
 
 
+def _core_fingerprint() -> str:
+    chunks = []
+    core_dir = ROOT / "core"
+    if core_dir.is_dir():
+        for path in sorted(core_dir.glob("*.py")):
+            stat = path.stat()
+            chunks.append(f"{path.name}:{stat.st_mtime_ns}:{stat.st_size}")
+    return "|".join(chunks)
+
+
+def _read_snapshot_info(db) -> dict:
+    reader = getattr(db, "snapshot_info", None)
+    if callable(reader):
+        return reader()
+    with db.get_connection() as conn:
+        n_matches = int(
+            conn.execute("SELECT COUNT(DISTINCT match_id) FROM match_stats").fetchone()[0]
+        )
+        raw_dates = [
+            row[0]
+            for row in conn.execute(
+                "SELECT fixture_date FROM match_stats WHERE fixture_date IS NOT NULL"
+            )
+        ]
+    if raw_dates:
+        parsed = pd.to_datetime(
+            pd.Series(raw_dates, dtype="object"),
+            utc=True,
+            format="mixed",
+            errors="coerce",
+        )
+        max_date = parsed.max() if not parsed.isna().all() else pd.NaT
+    else:
+        max_date = pd.NaT
+    return {"n_matches": n_matches, "max_date": max_date}
+
+
 @st.cache_resource
-def load_runtime():
+def load_runtime(code_fp: str):
     db = DartsDatabase(db_path=str(DB_PATH))
     with db.get_connection() as conn:
         raw_players = pd.read_sql_query(
@@ -22,7 +63,7 @@ def load_runtime():
             conn,
         )["player"].tolist()
     players = selectable_players(raw_players)
-    info = db.snapshot_info()
+    info = _read_snapshot_info(db)
     return db, FeatureExtractor(db), AdvancedDartsModel(db), players, raw_players, info
 
 
@@ -45,7 +86,7 @@ def main() -> None:
         "No es una herramienta de apuestas."
     )
 
-    db, fe, model, players, raw_players, info = load_runtime()
+    db, fe, model, players, raw_players, info = load_runtime(_core_fingerprint())
 
     st.caption(
         f"Datos hasta {_snapshot_cutoff(info)} · "
