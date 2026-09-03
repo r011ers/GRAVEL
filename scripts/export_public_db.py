@@ -1,5 +1,6 @@
 """Exporta data/darts_public.sqlite con match_stats (MSS Bo7), player_elo y player_elo_history."""
 
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -9,9 +10,10 @@ sys.path.insert(0, str(ROOT))
 
 from core.db import DartsDatabase
 
-SOURCE = Path(
-    r"C:\Users\erica\OneDrive\Desktop\MAIN\Wazowski BETS\vsc darts_model\02_MOTOR_CORE\darts.sqlite"
-)
+_source = os.environ.get("GRAVEL_SOURCE_DB", "").strip()
+if not _source:
+    raise SystemExit("Set GRAVEL_SOURCE_DB to the source SQLite path before exporting.")
+SOURCE = Path(_source)
 DEST = ROOT / "data" / "darts_public.sqlite"
 TABLES_FULL = ("player_elo", "player_elo_history")
 TABLE_FILTERED = "match_stats"

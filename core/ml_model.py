@@ -5,14 +5,15 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 
-import numpy as np
-import pandas as pd
+import hashlib
 import logging
 import pickle
-
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, Any
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import pandas as pd
 
 from .features import PlayerFeatures
 from .first_throw import (
@@ -32,7 +33,7 @@ except ImportError:
     SKLEARN_AVAILABLE = False
 
 
-logger = logging.getLogger("gravel_v12_ml")
+logger = logging.getLogger("gravel_ml")
 
 
 # ============================================================
@@ -88,14 +89,11 @@ class AdvancedDartsModel:
         self.meta_scaler = None
         self.meta_calibrator = None
 
-        self.elo_history = {}
         self.load_error: Optional[str] = None
 
         self.model_dir = Path(__file__).parent.parent / "models"
-        self.model_dir.mkdir(exist_ok=True)
 
         self._load_models()
-        self._precompute_elo_history()
 
     # ============================================================
     # LOAD MODELS
@@ -106,7 +104,6 @@ class AdvancedDartsModel:
         possible_paths = [
             self.model_dir / "darts_v8.pkl",
             Path(__file__).resolve().parent.parent / "models" / "darts_v8.pkl",
-            Path.cwd() / "02_MOTOR_CORE" / "models" / "darts_v8.pkl"
         ]
 
         target_path = None
@@ -119,6 +116,20 @@ class AdvancedDartsModel:
             self.load_error = f"Model file 'darts_v8.pkl' not found in any expected location: {[str(p) for p in possible_paths]}"
             logger.error(self.load_error)
             return
+
+        digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+        hash_file = target_path.with_name(target_path.name + ".sha256")
+        if hash_file.is_file():
+            expected = hash_file.read_text(encoding="utf-8").strip().split()[0]
+            if digest != expected:
+                self.load_error = (
+                    f"SHA256 mismatch for {target_path.name}: "
+                    f"got {digest}, expected {expected}"
+                )
+                logger.error(self.load_error)
+                return
+        else:
+            logger.warning("Model hash file not found: %s", hash_file)
 
         try:
             with open(target_path, "rb") as f:
@@ -142,98 +153,6 @@ class AdvancedDartsModel:
         except Exception as e:
             self.load_error = f"Error loading model from {target_path}: {e}"
             logger.error(self.load_error, exc_info=True)
-
-    # ============================================================
-    # ELO HISTORY
-    # ============================================================
-
-    def _precompute_elo_history(self):
-
-        self.elo_history = {}
-
-        if self.db is None:
-            return
-
-        logger.info("Precomputing ELO history...")
-
-        df = self.db.load_all_data()
-
-        if df.empty:
-            return
-
-        df = (
-            df
-            .sort_values(["fixture_date", "match_id"])
-            .reset_index(drop=True)
-        )
-
-        elo_map = {}
-        matches_count = {}
-
-        grouped = df.groupby("match_id", sort=False)
-
-        for mid, m_rows in grouped:
-
-            if len(m_rows) < 2:
-                continue
-
-            row_a = m_rows.iloc[0]
-            row_b = m_rows.iloc[1]
-
-            p_a = row_a["player"]
-            p_b = row_b["player"]
-
-            res_a = int(row_a["result"])
-
-            avg_a = row_a.get("score_avg", 0)
-            avg_b = row_b.get("score_avg", 0)
-
-            r_a = elo_map.get(p_a, 1500.0)
-            r_b = elo_map.get(p_b, 1500.0)
-
-            n_a = matches_count.get(p_a, 0)
-            n_b = matches_count.get(p_b, 0)
-
-            k_a = max(40.0 / (1.0 + (n_a / 30.0) ** 0.5), 16.0)
-            k_b = max(40.0 / (1.0 + (n_b / 30.0) ** 0.5), 16.0)
-
-            expected_a = 1 / (1 + 10 ** ((r_b - r_a) / 400))
-            expected_b = 1 - expected_a
-
-            avg_gap = abs(avg_a - avg_b)
-
-            margin_multiplier = 1.0 + min(avg_gap / 12.0, 1.5)
-
-            new_r_a = (
-                r_a +
-                k_a *
-                margin_multiplier *
-                (res_a - expected_a)
-            )
-
-            new_r_b = (
-                r_b +
-                k_b *
-                margin_multiplier *
-                ((1 - res_a) - expected_b)
-            )
-
-            elo_map[p_a] = new_r_a
-            elo_map[p_b] = new_r_b
-
-            matches_count[p_a] = n_a + 1
-            matches_count[p_b] = n_b + 1
-
-            self.elo_history.setdefault(p_a, []).append(new_r_a)
-            self.elo_history.setdefault(p_b, []).append(new_r_b)
-
-            self.elo_history[p_a] = self.elo_history[p_a][-10:]
-            self.elo_history[p_b] = self.elo_history[p_b][-10:]
-
-        logger.info(
-            f"ELO history loaded for "
-            f"{len(self.elo_history)} players."
-        )
 
     # ============================================================
     # ELO PROBABILITY

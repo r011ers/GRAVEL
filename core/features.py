@@ -8,9 +8,14 @@
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Any
+from typing import Optional, Any
 
 from .db import DartsDatabase
+from .identities import (
+    aliases_of,
+    canonical_player,
+    elo_source_name,
+)
 
 @dataclass
 class PlayerFeatures:
@@ -73,114 +78,62 @@ class FeatureExtractor:
     def __init__(self, db: DartsDatabase):
         self.db = db
         self._name_cache = {}
-        
+        self._all_names = None
+        self._matches_by_name = None
+
+    def _player_names(self) -> list:
+        if self._all_names is None:
+            with self.db.get_connection() as conn:
+                df_names = pd.read_sql_query("SELECT DISTINCT player FROM match_stats", conn)
+                counts = pd.read_sql_query(
+                    "SELECT player, COUNT(*) AS n FROM match_stats GROUP BY player",
+                    conn,
+                )
+            self._all_names = df_names["player"].tolist()
+            self._matches_by_name = dict(zip(counts["player"], counts["n"].astype(int)))
+        return self._all_names
+
+    def _resolve_player_name(self, player_name: str) -> str:
+        if player_name in self._name_cache:
+            return self._name_cache[player_name]
+        resolved = canonical_player(player_name, self._player_names())
+        self._name_cache[player_name] = resolved
+        return resolved
+
+    def _aliases(self, canonical: str) -> list:
+        return aliases_of(canonical, self._player_names())
+
     def _calculate_streak(self, series: pd.Series, limit=5) -> str:
         results = series.tail(limit).astype(int).tolist()
         return "".join("W" if r == 1 else "L" for r in results)
 
-    @staticmethod
-    def _name_tokens(name: str) -> frozenset:
-        return frozenset(t for t in str(name).lower().replace("-", " ").split() if t)
-
-    @staticmethod
-    def _name_match_ratio(query: str, candidate: str) -> float:
-        """Ratio de nombres; 1.0 si mismos tokens en distinto orden (Lesic Zvonimir ≈ Zvonimir Lesic)."""
-        import difflib
-        q = str(query).strip()
-        c = str(candidate).strip()
-        if not q or not c:
-            return 0.0
-        q_tok, c_tok = FeatureExtractor._name_tokens(q), FeatureExtractor._name_tokens(c)
-        if q_tok and q_tok == c_tok:
-            return 1.0
-        q_clean = q.replace(" ", "").lower()
-        c_clean = c.replace(" ", "").lower()
-        ratio = difflib.SequenceMatcher(None, q_clean, c_clean).ratio()
-        # orden invertido: "A B" vs "B A"
-        q_parts, c_parts = q.split(), c.split()
-        if len(q_parts) >= 2 and len(c_parts) >= 2:
-            q_rev = "".join(q_parts[::-1]).lower()
-            c_fwd = c_clean
-            ratio = max(ratio, difflib.SequenceMatcher(None, q_rev, c_fwd).ratio())
-            ratio = max(
-                ratio,
-                difflib.SequenceMatcher(
-                    None, "".join(q_parts).lower(), "".join(c_parts[::-1]).lower()
-                ).ratio(),
-            )
-        if q_clean in c_clean or c_clean in q_clean:
-            ratio = max(ratio, 0.85)
-        return ratio
-
-    def _resolve_player_name(self, player_name: str) -> str:
-        """Resuelve alias / orden invertido al nombre canónico con más partidos en BD."""
-        if player_name in self._name_cache:
-            return self._name_cache[player_name]
-
-        conn = self.db.get_connection()
-        df_names = pd.read_sql_query(
-            "SELECT player, COUNT(*) AS n FROM match_stats GROUP BY player",
-            conn,
-        )
-        conn.close()
-
-        best_name = player_name
-        best_ratio = 0.0
-        best_n = -1
-        q_tok = self._name_tokens(player_name)
-
-        for _, row in df_names.iterrows():
-            p_db = row["player"]
-            n = int(row["n"])
-            ratio = self._name_match_ratio(player_name, p_db)
-            # Preferir el alias con más historial a igualdad de match
-            if ratio > best_ratio + 1e-9 or (abs(ratio - best_ratio) < 1e-9 and n > best_n):
-                best_ratio = ratio
-                best_name = p_db
-                best_n = n
-
-        if best_ratio >= 0.8:
-            # Si hay varios con mismos tokens, canónico = el de más filas
-            if q_tok:
-                same = df_names[df_names["player"].map(lambda p: self._name_tokens(p) == q_tok)]
-                if not same.empty:
-                    best_name = same.sort_values("n", ascending=False).iloc[0]["player"]
-            self._name_cache[player_name] = best_name
-            return best_name
-
-        self._name_cache[player_name] = player_name
-        return player_name
-
     def _load_player_history(self, player_name: str) -> pd.DataFrame:
-        """Carga historial uniendo todos los alias con los mismos tokens de nombre."""
-        resolved = self._resolve_player_name(player_name)
-        tok = self._name_tokens(resolved) or self._name_tokens(player_name)
+        """Carga historial de todos los aliases canónicos y deduplica por match_id."""
+        canonical = self._resolve_player_name(player_name)
+        aliases = self._aliases(canonical)
+        frames = []
+        for alias in aliases:
+            da = self.db.load_player_data(alias)
+            if da is None or da.empty:
+                continue
+            da = da.copy()
+            da["_source_player"] = alias
+            frames.append(da)
+        if not frames:
+            return pd.DataFrame()
 
-        df = self.db.load_player_data(resolved)
-        if not tok:
-            return df
-
-        # Unir alias invertidos (misma persona, otro orden en scrape)
-        try:
-            conn = self.db.get_connection()
-            all_names = pd.read_sql_query("SELECT DISTINCT player FROM match_stats", conn)
-            conn.close()
-            aliases = [
-                p for p in all_names["player"].tolist()
-                if p != resolved and self._name_tokens(p) == tok
-            ]
-            if aliases:
-                frames = [df] if not df.empty else []
-                for a in aliases:
-                    da = self.db.load_player_data(a)
-                    if not da.empty:
-                        frames.append(da)
-                if frames:
-                    df = pd.concat(frames, ignore_index=True)
-                    if "fixture_date" in df.columns:
-                        df = df.sort_values(["fixture_date", "match_id"]).reset_index(drop=True)
-        except Exception:
-            pass
+        df = pd.concat(frames, ignore_index=True)
+        df["_pref"] = (df["_source_player"] == canonical).astype(int)
+        sort_cols = ["match_id", "_pref"]
+        if "id" in df.columns:
+            sort_cols.append("id")
+        df = df.sort_values(sort_cols, ascending=[True, False, True][: len(sort_cols)])
+        df = df.drop_duplicates(subset=["match_id"], keep="first")
+        df = df.drop(columns=["_source_player", "_pref"], errors="ignore")
+        if "fixture_date" in df.columns:
+            df = df.sort_values(["fixture_date", "match_id"], na_position="first").reset_index(drop=True)
+        else:
+            df = df.reset_index(drop=True)
         return df
 
     def get_player_features(self, player_name: str, form_window: int = 3, before_date: Optional[pd.Timestamp] = None, opp_avg: Optional[float] = None) -> Optional[PlayerFeatures]:
@@ -190,25 +143,22 @@ class FeatureExtractor:
 
         player_name = self._resolve_player_name(player_name)
         df = self._load_player_history(player_name)
-        if df.empty or len(df) < 5:
+        if df.empty or df["match_id"].nunique() < 5:
             return None
-            
-        # --- NORMALIZACIÓN DE ZONAS HORARIAS (Fix v11.1) ---
-        # Si los datos vienen de SQLite sin zona horaria, los localizamos a UTC
-        if not df.empty and df["fixture_date"].dt.tz is None:
+
+        if "fixture_date" in df.columns and df["fixture_date"].dt.tz is None:
             df["fixture_date"] = df["fixture_date"].dt.tz_localize("UTC")
-        
-        # Si el filtro before_date es naive, lo localizamos a UTC para que coincida
+
         if before_date is not None and before_date.tzinfo is None:
             before_date = before_date.tz_localize("UTC")
-            
-        # Filtrado point-in-time para backtesting
+
         if before_date is not None:
-            df = df[df["fixture_date"] < before_date]
-            if df.empty or len(df) < 5:
+            dated = df["fixture_date"].notna()
+            df = df.loc[dated & (df["fixture_date"] < before_date)]
+            if df.empty or df["match_id"].nunique() < 5:
                 return None
-            
-        n = len(df)
+
+        n = int(df["match_id"].nunique())
         
         # Histórico
         avg_score = df["score_avg"].mean()
@@ -252,10 +202,9 @@ class FeatureExtractor:
         home_wr = df_home["result"].mean() if not df_home.empty else win_rate
         away_wr = df_away["result"].mean() if not df_away.empty else win_rate
 
-        # Días desde último partido
         days_since = None
-        if pd.notna(df["fixture_date"].max()):
-            last_date = df["fixture_date"].max()
+        last_date = df["fixture_date"].max() if "fixture_date" in df.columns else pd.NaT
+        if pd.notna(last_date):
             if last_date.tzinfo is None:
                 from datetime import timezone
                 last_date = last_date.replace(tzinfo=timezone.utc)
@@ -287,8 +236,9 @@ class FeatureExtractor:
         
         hour_dec = match_ref_date.hour + match_ref_date.minute / 60.0
 
-        # --- ELO DATA ---
-        elo_data = self.db.get_player_elo_at_time(player_name, before_date)
+        self._player_names()
+        elo_name = elo_source_name(player_name, self._all_names, self._matches_by_name or {})
+        elo_data = self.db.get_player_elo_at_time(elo_name, before_date)
 
         # --- NUEVAS FEATURES v8 AUDIT ---
         
@@ -322,14 +272,23 @@ class FeatureExtractor:
         pressure_delta = co_decider - co_normal
 
         # 4. VS Similar Profile (Real implementation via SQL)
-        vs_similar_wr = self.db.get_vs_similar_wr(player_name, opp_avg, before_date) if opp_avg else win_rate
+        vs_similar_wr = (
+            self.db.get_vs_similar_wr(
+                player_name,
+                opp_avg,
+                before_date,
+                player_aliases=self._aliases(player_name),
+            )
+            if opp_avg
+            else win_rate
+        )
 
         # 5. Volatility (Standard deviation of score_avg)
         avg_std_val = df["score_avg"].std()
         avg_std = float(avg_std_val) if pd.notna(avg_std_val) else 0.0
 
         # 6. ELO Momentum (Novedad v13: diferencia contra el ELO de hace 5 partidos)
-        elo_hist = self.db.get_player_elo_history_before(player_name, before_date, limit=6)
+        elo_hist = self.db.get_player_elo_history_before(elo_name, before_date, limit=6)
         elo_momentum = 0.0
         if len(elo_hist) >= 6:
             elo_momentum = float(elo_data["elo"] - elo_hist[-1])
@@ -376,20 +335,46 @@ class FeatureExtractor:
 
 
     def get_h2h_summary(self, player_a: str, player_b: str, before_date: Optional[pd.Timestamp] = None) -> dict:
-        df_a = self.db.get_h2h(player_a, player_b)
-        df_b = self.db.get_h2h(player_b, player_a)
-        
-        # Normalizar zonas horarias (Fix v11.1)
+        names = self._player_names()
+        canon_a = canonical_player(player_a, names)
+        canon_b = canonical_player(player_b, names)
+        empty = {
+            "n_matches": 0,
+            "win_rate_a": 0.5,
+            "avg_a": 0.0,
+            "avg_b": 0.0,
+            "avg_checkout_a": 0.0,
+            "avg_checkout_b": 0.0,
+            "avg_100s_a": 0.0, "avg_140s_a": 0.0, "avg_180s_a": 0.0,
+            "avg_100s_b": 0.0, "avg_140s_b": 0.0, "avg_180s_b": 0.0,
+        }
+        if canon_a == canon_b:
+            return empty
+
+        aliases_a = aliases_of(canon_a, names)
+        aliases_b = aliases_of(canon_b, names)
+        df_a = self.db.get_h2h(canon_a, canon_b, aliases_a=aliases_a, aliases_b=aliases_b)
+        df_b = self.db.get_h2h(canon_b, canon_a, aliases_a=aliases_b, aliases_b=aliases_a)
+
+        if not df_a.empty and "match_id" in df_a.columns:
+            df_a = df_a.drop_duplicates(subset=["match_id"], keep="first")
+        if not df_b.empty and "match_id" in df_b.columns:
+            df_b = df_b.drop_duplicates(subset=["match_id"], keep="first")
+
         if not df_a.empty and df_a["fixture_date"].dt.tz is None:
             df_a["fixture_date"] = df_a["fixture_date"].dt.tz_localize("UTC")
         if not df_b.empty and df_b["fixture_date"].dt.tz is None:
             df_b["fixture_date"] = df_b["fixture_date"].dt.tz_localize("UTC")
-        
+
         if before_date is not None:
             if before_date.tzinfo is None:
                 before_date = before_date.tz_localize("UTC")
-            df_a = df_a[df_a["fixture_date"] < before_date]
-            df_b = df_b[df_b["fixture_date"] < before_date]
+            if not df_a.empty:
+                dated = df_a["fixture_date"].notna()
+                df_a = df_a.loc[dated & (df_a["fixture_date"] < before_date)]
+            if not df_b.empty:
+                dated = df_b["fixture_date"].notna()
+                df_b = df_b.loc[dated & (df_b["fixture_date"] < before_date)]
             
         if df_a.empty and df_b.empty:
             return {
@@ -403,7 +388,7 @@ class FeatureExtractor:
                 "avg_100s_b": 0.0, "avg_140s_b": 0.0, "avg_180s_b": 0.0,
             }
             
-        n_h2h = len(df_a)
+        n_h2h = int(df_a["match_id"].nunique()) if not df_a.empty else 0
         raw_wr = float(df_a["result"].mean()) if not df_a.empty else 0.5
         shrunk_wr = (raw_wr * n_h2h + 0.5 * 5.0) / (n_h2h + 5.0)
         return {

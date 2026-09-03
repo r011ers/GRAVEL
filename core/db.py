@@ -1,153 +1,105 @@
-"""
-GRAVEL — db.py
-Capa de acceso a la base de datos filtrada.
-"""
+"""Capa de acceso al snapshot SQLite público (solo lectura)."""
 
 import sqlite3
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Sequence
 import logging
 import datetime
 
-logger = logging.getLogger("beta_db")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("gravel_db")
+
+
+def parse_fixture_dates(values) -> pd.Series:
+    """Parsea fixture_date a UTC. NULL y valores ilegibles → NaT. No inventa fechas."""
+    s = pd.Series(values)
+    if s.empty:
+        return pd.to_datetime(s, utc=True)
+    return pd.to_datetime(s, utc=True, format="mixed", errors="coerce")
+
+
+def clip_checkout_pct(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "checkout_pct" not in df.columns:
+        return df
+    out = df.copy()
+    out["checkout_pct"] = out["checkout_pct"].clip(lower=0, upper=100)
+    return out
+
+
+def _prepare_match_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = clip_checkout_pct(df)
+    if "fixture_date" in out.columns:
+        out = out.copy()
+        out["fixture_date"] = parse_fixture_dates(out["fixture_date"])
+    return out
 
 
 class DartsDatabase:
     def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
-            # Ruta centralizada en la raíz de 02_MOTOR_CORE
-            self.db_path = str(Path(__file__).resolve().parent.parent / "darts.sqlite")
+            self.db_path = str(
+                Path(__file__).resolve().parent.parent / "data" / "darts_public.sqlite"
+            )
         else:
             self.db_path = db_path
-        self._init_db()
-
-    def _init_db(self):
-        """Inicializa la estructura de la base de datos si no existe."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Tabla de calibración (Platt Scaling) para los modelos
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS model_calibration (
-                model_id TEXT PRIMARY KEY,
-                param_a REAL NOT NULL,
-                param_b REAL NOT NULL,
-                last_updated DATETIME
-            )
-        """)
-
-        # Tabla de histórico de predicciones para Calibración y Backtest
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS prediction_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                match_id INTEGER NOT NULL,
-                model_version TEXT NOT NULL,
-                prob_a REAL NOT NULL,
-                actual_result INTEGER, -- 1 si ganó A, 0 si perdió, NULL si pendiente
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(match_id, model_version)
-            )
-        """)
-        
-        # Tabla de ELO Rankings (v11 Pro)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS player_elo (
-                player TEXT PRIMARY KEY,
-                elo REAL NOT NULL DEFAULT 1500.0,
-                matches_played INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'DEBUT', -- DEBUT (<5 matches) vs PRO
-                last_updated DATETIME
-            )
-        """)
-
-        # Tabla de ELO History (Novedad v13 para evitar look-ahead bias)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS player_elo_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                player TEXT NOT NULL,
-                match_id INTEGER NOT NULL,
-                elo REAL NOT NULL,
-                fixture_date DATETIME,
-                matches_played INTEGER,
-                UNIQUE(player, match_id)
-            )
-        """)
-
-        
-        # Tabla principal de partidos
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS match_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                match_id INTEGER NOT NULL,
-                player TEXT NOT NULL,
-                opponent TEXT NOT NULL,
-                score_avg REAL,
-                checkout_pct REAL,
-                turns_100 INTEGER,
-                turns_140 INTEGER,
-                turns_180 INTEGER,
-                first_throw INTEGER,
-                result INTEGER,
-                legs_won INTEGER,
-                total_legs INTEGER,
-                is_decider INTEGER,
-                fixture_date DATETIME,
-                UNIQUE(match_id, player)
-            )
-        """)
-        
-        # Índices para búsquedas súper rápidas de histórico y h2h
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_player ON match_stats(player)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_opponent ON match_stats(opponent)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_date ON match_stats(fixture_date)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_elo_hist_player_date ON player_elo_history(player, fixture_date)")
-
-        
-        conn.commit()
-        conn.close()
+        path = Path(self.db_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"SQLite snapshot not found: {self.db_path}")
 
     def get_connection(self):
-        return sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn = sqlite3.connect(str(Path(self.db_path).resolve()))
+        conn.execute("PRAGMA query_only = ON")
+        return conn
 
     def load_player_data(self, player_name: str) -> pd.DataFrame:
         """Historial MSS Bo7 de un jugador."""
-        conn = self.get_connection()
         query = f"""
             SELECT * FROM match_stats
             WHERE player = ? AND {self._MSS_BO7_WHERE}
             ORDER BY fixture_date ASC, match_id ASC
         """
-        df = pd.read_sql_query(query, conn, params=(player_name,), parse_dates=["fixture_date"])
-        conn.close()
-        return df
+        with self.get_connection() as conn:
+            df = pd.read_sql_query(query, conn, params=(player_name,))
+        return _prepare_match_frame(df)
 
-    def get_h2h(self, player_a: str, player_b: str) -> pd.DataFrame:
-        """Enfrentamientos directos MSS Bo7."""
-        conn = self.get_connection()
+    def get_h2h(
+        self,
+        player_a: str,
+        player_b: str,
+        aliases_a: Optional[Sequence[str]] = None,
+        aliases_b: Optional[Sequence[str]] = None,
+    ) -> pd.DataFrame:
+        """Enfrentamientos directos MSS Bo7 (acepta aliases canónicos)."""
+        names_a = list(aliases_a) if aliases_a else [player_a]
+        names_b = list(aliases_b) if aliases_b else [player_b]
+        ph_a = ",".join("?" * len(names_a))
+        ph_b = ",".join("?" * len(names_b))
         query = f"""
             SELECT * FROM match_stats
-            WHERE player = ? AND opponent = ? AND {self._MSS_BO7_WHERE}
+            WHERE player IN ({ph_a}) AND opponent IN ({ph_b}) AND {self._MSS_BO7_WHERE}
             ORDER BY fixture_date ASC
         """
-        df = pd.read_sql_query(query, conn, params=(player_a, player_b), parse_dates=["fixture_date"])
-        conn.close()
-        return df
+        with self.get_connection() as conn:
+            df = pd.read_sql_query(query, conn, params=(*names_a, *names_b))
+        return _prepare_match_frame(df)
 
-    def get_vs_similar_wr(self, player_name: str, opponent_avg: float, before_date: Optional[datetime.datetime] = None, margin: float = 5.0) -> float:
+    def get_vs_similar_wr(self, player_name: str, opponent_avg: float, before_date: Optional[datetime.datetime] = None, margin: float = 5.0, player_aliases: Optional[Sequence[str]] = None) -> float:
         """
         Calcula el Win Rate de un jugador contra oponentes de nivel similar (peer performance).
         Lógica: busca partidos del jugador donde el oponente tenía un avg ± margin del actual.
         """
         conn = self.get_connection()
-        query = """
+        names = list(player_aliases) if player_aliases else [player_name]
+        ph = ",".join("?" * len(names))
+        query = f"""
             SELECT ms_player.result, ms_opp.score_avg as opp_avg
             FROM match_stats ms_player
             JOIN match_stats ms_opp 
               ON ms_player.match_id = ms_opp.match_id 
               AND ms_opp.player = ms_player.opponent
-            WHERE ms_player.player = ? 
+            WHERE ms_player.player IN ({ph})
               AND ms_player.fixture_date < ?
               AND ms_opp.score_avg BETWEEN ? AND ?
               AND ms_player.match_id < 100000000
@@ -174,9 +126,9 @@ class DartsDatabase:
             
             # Cargamos con pandas para manejar la zona horaria después si es necesario
             df = pd.read_sql_query(query, conn, params=(
-                player_name, 
-                ref_date.strftime('%Y-%m-%d %H:%M:%S'), # Pasamos como string para evitar líos de TZ en el driver
-                opponent_avg - margin, 
+                *names,
+                ref_date.strftime('%Y-%m-%d %H:%M:%S'),
+                opponent_avg - margin,
                 opponent_avg + margin
             ))
             conn.close()
@@ -199,14 +151,36 @@ class DartsDatabase:
 
     def load_all_data(self) -> pd.DataFrame:
         """Carga solo histórico MSS singles Best of 7."""
-        conn = self.get_connection()
-        df = pd.read_sql_query(
-            f"SELECT * FROM match_stats WHERE {self._MSS_BO7_WHERE}",
-            conn,
-            parse_dates=["fixture_date"],
-        )
-        conn.close()
-        return df
+        with self.get_connection() as conn:
+            df = pd.read_sql_query(
+                f"SELECT * FROM match_stats WHERE {self._MSS_BO7_WHERE}",
+                conn,
+            )
+        return _prepare_match_frame(df)
+
+    def snapshot_info(self) -> Dict[str, Any]:
+        with self.get_connection() as conn:
+            n_rows = conn.execute("SELECT COUNT(*) FROM match_stats").fetchone()[0]
+            n_matches = conn.execute("SELECT COUNT(DISTINCT match_id) FROM match_stats").fetchone()[0]
+            n_players = conn.execute("SELECT COUNT(DISTINCT player) FROM match_stats").fetchone()[0]
+            n_null = conn.execute(
+                "SELECT COUNT(*) FROM match_stats WHERE fixture_date IS NULL"
+            ).fetchone()[0]
+            raw_dates = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT fixture_date FROM match_stats WHERE fixture_date IS NOT NULL"
+                )
+            ]
+        parsed = parse_fixture_dates(raw_dates)
+        max_date = parsed.max() if not parsed.isna().all() else pd.NaT
+        return {
+            "n_rows": int(n_rows),
+            "n_matches": int(n_matches),
+            "n_players_raw": int(n_players),
+            "n_null_dates": int(n_null),
+            "max_date": max_date,
+        }
 
     def get_player_elo(self, player_name: str) -> Dict[str, Any]:
         """Obtiene el rating ELO y el ranking de un jugador."""
